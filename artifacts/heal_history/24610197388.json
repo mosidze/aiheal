@@ -1,0 +1,28 @@
+{
+  "run_id": "24610197388",
+  "timestamp": "2026-04-18T17:39:30Z",
+  "model": "llama-3.3-70b-versatile",
+  "iteration": 0,
+  "findings_blocking": [
+    "security:docker:consolidated"
+  ],
+  "findings_advisory": [
+    "legacy_base_image",
+    "single_stage_build",
+    "root_runtime",
+    "missing_healthcheck"
+  ],
+  "plan_summary": "The current Dockerfile has multiple high/CRITICAL CVEs reported by the scanners and uses a legacy base image. To remediate, the base image will be updated to a stable, supported version and a multi-stage build will be used to reduce the runtime size and attack surface. Additionally, a dedicated runtime user will be added to improve security.",
+  "targeted_findings": [
+    "security:docker:consolidated",
+    "legacy_base_image",
+    "single_stage_build",
+    "root_runtime"
+  ],
+  "files_touched": [
+    "Dockerfile"
+  ],
+  "preheal_passed": false,
+  "postheal_passed": false,
+  "tokens_total": 4707
+}
