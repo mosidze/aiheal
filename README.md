@@ -1,5 +1,7 @@
 # aiheal
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 **GitHub-native self-healing CI with AI triage and a human-in-the-loop gate.**
 
 Six scanners find issues. An AI triages them. You click Approve. Another AI proposes the fix and opens a PR. The application code is off-limits — AI only touches `Dockerfile`, `docker-compose.yml`, and `.github/workflows/*`.
@@ -161,3 +163,7 @@ Install Ollama, `ollama pull llama3.1`, copy `.env.example` to `.env`, set `AI_P
 ## About the demo app
 
 A minimal Go login API (`register`, `login`, `me`, `users`) with Postgres. Endpoint details in [APP.md](APP.md). The app is a fixed target for the pipeline — its code is intentionally boring.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
