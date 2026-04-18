@@ -1,0 +1,297 @@
+name: github-actions-aiheal-showcase
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      iteration:
+        description: "Aiheal iteration counter"
+        required: false
+        default: "0"
+      security_source_run_id:
+        description: "Optional devsecops workflow run id carrying security handoff"
+        required: false
+        default: ""
+
+concurrency:
+  group: aiheal-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  pull-requests: write
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Install actionlint
+        run: |
+          curl -fsSL -o /tmp/download-actionlint.bash https://raw.githubusercontent.com/rhysd/actionlint/v1.7.1/scripts/download-actionlint.bash
+          bash /tmp/download-actionlint.bash 1.7.1 /usr/local/bin
+
+      - name: Run linters
+        run: |
+          actionlint
+          yamllint -s docker-compose.yml .github/
+
+      - name: Run tests
+        run: pytest scripts/tests/ -v
+
+  diagnose:
+    runs-on: ubuntu-latest
+    outputs:
+      blocking_issues_found: ${{ steps.findings.outputs.blocking_issues_found }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run pre-heal verification
+        continue-on-error: true
+        env:
+          VERIFY_URL: http://127.0.0.1:8080
+        run: python scripts/verify_showcase.py --output-dir artifacts/preheal --url "$VERIFY_URL"
+
+      - name: Pull security handoff (if any)
+        if: ${{ inputs.security_source_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          gh run download ${{ inputs.security_source_run_id }} -n security-handoff -D artifacts/ || true
+
+      - name: Collect findings
+        id: findings
+        run: |
+          if [ -f artifacts/security_handoff.json ]; then
+            python scripts/collect_findings.py \
+              --verification artifacts/preheal/verification.json \
+              --logs artifacts/preheal/runtime.log \
+              --output artifacts/findings.json \
+              --security-handoff artifacts/security_handoff.json
+          else
+            python scripts/collect_findings.py \
+              --verification artifacts/preheal/verification.json \
+              --logs artifacts/preheal/runtime.log \
+              --output artifacts/findings.json
+          fi
+
+      - name: Upload diagnosis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnosis
+          path: artifacts/
+
+  aiheal:
+    runs-on: ubuntu-latest
+    needs: diagnose
+    if: needs.diagnose.outputs.blocking_issues_found == 'true' && vars.AIHEAL_DISABLED != 'true' && vars.AIHEAL_DISABLED != '1'
+    env:
+      VERIFY_URL: http://127.0.0.1:8080
+      AIHEAL_ITERATION: ${{ inputs.iteration || '0' }}
+    steps:
+      - name: Check killswitch
+        if: ${{ vars.AIHEAL_DISABLED == 'true' || vars.AIHEAL_DISABLED == '1' }}
+        run: |
+          echo "AIHEAL_DISABLED is set; skipping aiheal." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Download diagnosis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: diagnosis
+          path: artifacts
+
+      - name: Generate remediation plan
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          AI_PROVIDER: ${{ secrets.AI_PROVIDER }}
+        run: python scripts/generate_remediation_plan.py --findings artifacts/findings.json --output artifacts/remediation_plan.json
+
+      - name: Validate remediation plan
+        run: python scripts/validate_remediation.py --plan artifacts/remediation_plan.json
+
+      - name: Apply AI remediation
+        run: python scripts/apply_remediation.py --plan artifacts/remediation_plan.json --patch artifacts/proposed.patch
+
+      - name: Run post-heal verification
+        id: post_verify
+        continue-on-error: true
+        run: python scripts/verify_showcase.py --output-dir artifacts/postheal --url "$VERIFY_URL"
+
+      - name: Persist heal record
+        if: always()
+        run: |
+          python scripts/write_heal_record.py \
+            --findings artifacts/findings.json \
+            --plan artifacts/remediation_plan.json \
+            --pre artifacts/preheal/verification.json \
+            --post artifacts/postheal/verification.json \
+            --state artifacts/remediation_state.json \
+            --usage artifacts/ai_usage.jsonl \
+            --output artifacts/heal_history/${{ github.run_id }}.json
+
+      - name: Build final report
+        run: python scripts/render_summary.py --findings artifacts/findings.json --plan artifacts/remediation_plan.json --pre artifacts/preheal/verification.json --post artifacts/postheal/verification.json --state artifacts/remediation_state.json --usage artifacts/ai_usage.jsonl --output artifacts/final_report.md
+
+      - name: Upload aiheal artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiheal-results
+          path: artifacts/
+
+      - name: Publish step summary
+        if: always()
+        run: cat artifacts/final_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create heal PR
+        if: steps.post_verify.outcome == 'success'
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- Dockerfile docker-compose.yml .github/workflows artifacts/heal_history; then
+            echo "No AI changes to commit."
+            exit 0
+          fi
+
+          workflow_touched="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          state = json.loads(Path("artifacts/remediation_state.json").read_text())
+          print("true" if state.get("workflow_touched") else "false")
+          PY
+          )"
+          commit_message="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          plan = json.loads(Path("artifacts/remediation_plan.json").read_text())
+          print(plan.get("commit_message", "aiheal: apply AI remediation"))
+          PY
+          )"
+
+          branch="aiheal/run-${RUN_ID}-${RUN_ATTEMPT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Dockerfile docker-compose.yml .github/workflows
+          git add -f "artifacts/heal_history/${RUN_ID}.json" artifacts/heal_history/INDEX.jsonl
+          git commit -m "$commit_message"
+          git push origin "$branch"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          plan = json.loads(Path("artifacts/remediation_plan.json").read_text())
+          findings = json.loads(Path("artifacts/findings.json").read_text())
+          state = json.loads(Path("artifacts/remediation_state.json").read_text())
+          heal_record = json.loads(Path(f"artifacts/heal_history/{os.environ['RUN_ID']}.json").read_text())
+          patch = Path("artifacts/proposed.patch").read_text()[:5000]
+
+          summary = " ".join(str(plan.get("summary", "AI remediation")).split()) or "AI remediation"
+          title_summary = summary[:60]
+          if len(summary) > 60:
+              title_summary = f"{summary[:57]}..."
+          Path("artifacts/pr_title.txt").write_text(f"aiheal: {title_summary}\n")
+
+          issue_titles = {}
+          for issue in findings.get("issues", []) + findings.get("advisory_issues", []):
+              issue_id = issue.get("id")
+              if issue_id:
+                  issue_titles[str(issue_id)] = issue.get("title", "")
+
+          targeted = []
+          for item in plan.get("targeted_findings", []):
+              if isinstance(item, dict):
+                  finding_id = item.get("id")
+              else:
+                  finding_id = item
+              if finding_id:
+                  targeted.append(f"- {finding_id}: {issue_titles.get(str(finding_id), 'unknown finding')}")
+          if not targeted:
+              targeted.append("- None")
+
+          files_touched = [f"- {path}" for path in state.get("files_touched", [])] or ["- None"]
+          model = heal_record.get("model") or "unknown-model"
+          workflow_run = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['RUN_ID']}"
+
+          body_lines = [
+              "## Auto-generated remediation",
+              summary,
+              "### Findings addressed",
+              *targeted,
+              "### Files touched",
+              *files_touched,
+              "### Token usage",
+              f"- {heal_record.get('tokens_total', 0)} tokens, {model}",
+              "### Workflow run",
+              f"- {workflow_run}",
+              "### Diff (truncated)",
+              "```diff",
+              patch,
+              "```",
+          ]
+          Path("artifacts/pr_body.md").write_text("\n".join(body_lines) + "\n")
+          PY
+
+          gh label create aiheal --color 0E8A16 --description "AI-generated aiheal PR" 2>/dev/null || true
+          gh label create automated --color C5DEF5 --description "Automated PR" 2>/dev/null || true
+
+          gh pr create --title "$(cat artifacts/pr_title.txt)" \
+                       --label aiheal --label automated \
+                       --body-file artifacts/pr_body.md
+
+          if [ "$workflow_touched" = "true" ] && [ "${AIHEAL_ITERATION:-0}" -lt 1 ]; then
+            gh workflow run aiheal-showcase.yml --ref "$branch" -f iteration=$((AIHEAL_ITERATION + 1))
+          fi
+
+  no_issues:
+    runs-on: ubuntu-latest
+    needs: diagnose
+    if: needs.diagnose.outputs.blocking_issues_found != 'true'
+    steps:
+      - name: Report clean state
+        run: |
+          {
+            echo "## Self-Healing Showcase"
+            echo ""
+            echo "No blocking Docker or pipeline failures were detected. No AI remediation was triggered."
+          } >> "$GITHUB_STEP_SUMMARY"

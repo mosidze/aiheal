@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+!artifacts/heal_history/
+!artifacts/heal_history/.gitkeep
+!artifacts/heal_history/**
+reports/
+bin/
+.vs/

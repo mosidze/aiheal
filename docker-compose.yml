@@ -1,0 +1,40 @@
+services:
+  login:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASSWORD=password
+      - JWT_SIGNING_STRING=SuperSecret
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - status=$$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/users || true); [ "$$status" -ge 400 ] && [ "$$status" -lt 500 ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+  db:
+    image: postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=users
+    volumes:
+      - ./local-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U root -d users
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
